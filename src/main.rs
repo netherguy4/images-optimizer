@@ -7,6 +7,7 @@ use std::io::Write;
 use std::path::{Path, PathBuf};
 use std::process::Command;
 use std::sync::atomic::{AtomicU64, Ordering};
+use std::time::Instant;
 use tempfile::TempDir;
 use walkdir::WalkDir;
 use image::GenericImageView;
@@ -159,21 +160,23 @@ fn generate_avif(img: &image::DynamicImage, path: &Path, original_size: u64) -> 
                 }
             }
         },
-        Err(e) => eprintln!("Ошибка AVIF для {:?}: {}", path, e),
+        Err(e) => eprintln!("AVIF Error for {:?}: {}", path, e),
     }
     0
 }
 
 fn main() {
     let args = Args::parse();
+    let total_start_time = Instant::now();
 
-    println!("Подготовка...");
+    println!("Preparing...");
     let (_tmp, pq, oxi) = match unpack_png_tools() {
         Ok(t) => t,
         Err(e) => { eprintln!("{}", e); return; }
     };
 
-    println!("Сканирование: {}", args.path);
+    println!("Scanning: {}", args.path);
+    let scan_start = Instant::now();
     let supported_exts = ["png", "jpg", "jpeg"];
     let files: Vec<PathBuf> = WalkDir::new(&args.path)
         .into_iter()
@@ -185,20 +188,29 @@ fn main() {
         })
         .map(|e| e.into_path())
         .collect();
+    let scan_duration = scan_start.elapsed();
 
     if files.is_empty() {
-        println!("Файлы не найдены.");
+        println!("No files found.");
         return;
     }
 
-    println!("Найдено: {}. Старт...", files.len());
+    println!("Found: {} files. Processing (Scan time: {:.2?})...", files.len(), scan_duration);
     let bar = ProgressBar::new(files.len() as u64);
     bar.set_style(ProgressStyle::with_template("{spinner:.green} [{elapsed_precise}] [{bar:40.cyan/blue}] {pos}/{len}").unwrap().progress_chars("#>-"));
 
     let total_input_size = AtomicU64::new(0);
+    
     let saved_orig = AtomicU64::new(0);
     let saved_webp = AtomicU64::new(0);
     let saved_avif = AtomicU64::new(0);
+
+    let time_jpg = AtomicU64::new(0);
+    let time_png = AtomicU64::new(0);
+    let time_webp = AtomicU64::new(0);
+    let time_avif = AtomicU64::new(0);
+
+    let process_start_time = Instant::now();
 
     files.par_iter().for_each(|path| {
         let ext = path.extension().unwrap_or_default().to_string_lossy().to_lowercase();
@@ -209,61 +221,83 @@ fn main() {
         if args.webp || args.avif {
             if let Ok(img) = image::open(path) {
                 if args.webp {
+                    let t = Instant::now();
                     let s = generate_webp(&img, path, 75.0, original_file_size);
+                    time_webp.fetch_add(t.elapsed().as_millis() as u64, Ordering::Relaxed);
                     saved_webp.fetch_add(s, Ordering::Relaxed);
                 }
                 if args.avif {
+                    let t = Instant::now();
                     let s = generate_avif(&img, path, original_file_size);
+                    time_avif.fetch_add(t.elapsed().as_millis() as u64, Ordering::Relaxed);
                     saved_avif.fetch_add(s, Ordering::Relaxed);
                 }
             }
         }
 
+        let t_orig = Instant::now();
         let s_orig = if ext == "png" {
-            process_png(path, &pq, &oxi, args.png_min, args.png_max)
+            let res = process_png(path, &pq, &oxi, args.png_min, args.png_max);
+            time_png.fetch_add(t_orig.elapsed().as_millis() as u64, Ordering::Relaxed);
+            res
         } else {
-            process_jpg(path, args.jpg_q)
+            let res = process_jpg(path, args.jpg_q);
+            time_jpg.fetch_add(t_orig.elapsed().as_millis() as u64, Ordering::Relaxed);
+            res
         };
         saved_orig.fetch_add(s_orig, Ordering::Relaxed);
 
         bar.inc(1);
     });
 
-    bar.finish_with_message("Готово");
+    bar.finish_with_message("Done");
+    let process_duration = process_start_time.elapsed();
+    let total_duration = total_start_time.elapsed();
 
     let total_in = total_input_size.load(Ordering::Relaxed);
     let s_orig = saved_orig.load(Ordering::Relaxed);
     let s_webp = saved_webp.load(Ordering::Relaxed);
     let s_avif = saved_avif.load(Ordering::Relaxed);
 
-    println!("\n📊 Итоговые результаты:");
+    let t_jpg = time_jpg.load(Ordering::Relaxed);
+    let t_png = time_png.load(Ordering::Relaxed);
+    let t_webp = time_webp.load(Ordering::Relaxed);
+    let t_avif = time_avif.load(Ordering::Relaxed);
+
+    println!("\n📊 Final Results:");
     
     let calc_perc = |saved: u64| -> f64 {
         if total_in > 0 { (saved as f64 / total_in as f64) * 100.0 } else { 0.0 }
     };
 
-    println!("   Исходный общий вес:  {}", format_size(total_in, DECIMAL));
+    println!("   Total input size:    {}", format_size(total_in, DECIMAL));
+    println!("   Total wall time:     {:.2?}", total_duration);
+    println!("   Processing duration: {:.2?}", process_duration);
     println!("   ------------------------------------------------");
     
-    println!("   После сжатия (JPG/PNG): {} (🔻{:.1}%)", 
+    println!("   Optimization (JPG/PNG): {} (🔻{:.1}%)", 
         format_size(total_in - s_orig, DECIMAL), 
         calc_perc(s_orig)
     );
+    if t_jpg > 0 { println!("     L JPG Cumulative Time: {:.2}s", t_jpg as f64 / 1000.0); }
+    if t_png > 0 { println!("     L PNG Cumulative Time: {:.2}s", t_png as f64 / 1000.0); }
     
     if args.webp {
-        println!("   Версия WebP (Итого):    {} (🔻{:.1}%)", 
+        println!("   WebP Generation:        {} (🔻{:.1}%)", 
             format_size(total_in - s_webp, DECIMAL), 
             calc_perc(s_webp)
         );
+        println!("     L Time taken:          {:.2}s", t_webp as f64 / 1000.0);
     }
     
     if args.avif {
-        println!("   Версия AVIF (Итого):    {} (🔻{:.1}%)", 
+        println!("   AVIF Generation:        {} (🔻{:.1}%)", 
             format_size(total_in - s_avif, DECIMAL), 
             calc_perc(s_avif)
         );
+        println!("     L Time taken:          {:.2}s", t_avif as f64 / 1000.0);
     }
     
-    println!("\nНажмите Enter для выхода...");
+    println!("\nPress Enter to exit...");
     let _ = std::io::stdin().read_line(&mut String::new());
 }
