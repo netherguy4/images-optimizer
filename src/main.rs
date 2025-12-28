@@ -2,6 +2,7 @@ use clap::Parser;
 use humansize::{format_size, DECIMAL};
 use indicatif::{ProgressBar, ProgressStyle};
 use rayon::prelude::*;
+use std::ffi::OsStr;
 use std::fs;
 use std::io::Write;
 use std::path::{Path, PathBuf};
@@ -19,8 +20,8 @@ const OXIPNG_BIN: &[u8] = include_bytes!("../bin/oxipng.exe");
 #[derive(Parser, Debug)]
 #[command(author, version, about)]
 struct Args {
-    #[arg(short, long, default_value = ".")]
-    path: String,
+    #[arg(default_value = ".", value_delimiter = ',', num_args = 1..)]
+    paths: Vec<String>,
 
     #[arg(long, default_value_t = 80)]
     jpg_q: u8,
@@ -40,7 +41,6 @@ struct Args {
     #[arg(long)]
     replace: bool,
 
-    /// Silent mode: shows only progress bar, no stats, no wait for enter
     #[arg(short = 'S', long)]
     silent: bool,
 }
@@ -193,7 +193,6 @@ fn main() {
     let args = Args::parse();
     let total_start_time = Instant::now();
 
-    // Show warnings only if NOT silent
     if args.avif && !args.silent {
         println!("\x1b[93m⚠️  WARNING: AVIF encoding is active.\x1b[0m");
         println!("\x1b[93m   This process is extremely CPU intensive and may take significantly longer.\x1b[0m");
@@ -207,61 +206,118 @@ fn main() {
         Err(e) => { eprintln!("{}", e); return; }
     };
 
-    let input_path = PathBuf::from(&args.path);
-    let target_dir: PathBuf;
-    let copy_duration;
+    let supported_exts = ["png", "jpg", "jpeg"];
+    let mut files_to_process: Vec<(PathBuf, PathBuf)> = Vec::new();
+    let mut copy_duration = std::time::Duration::new(0, 0);
+    let scan_start = Instant::now();
 
-    if args.replace {
-        target_dir = input_path.clone();
-        copy_duration = std::time::Duration::new(0, 0);
-        if !args.silent { println!("Mode: \x1b[31mREPLACE\x1b[0m (Overwriting files in {:?})", target_dir); }
-    } else {
-        let root_name = input_path.file_name().unwrap_or_default().to_string_lossy();
-        let new_name = format!("{}__optimized", root_name);
-        target_dir = input_path.parent().unwrap_or(Path::new(".")).join(new_name);
-        
-        if target_dir.exists() {
-            if !args.silent { println!("Cleaning up existing output directory: {:?}", target_dir); }
-            if let Err(e) = fs::remove_dir_all(&target_dir) {
-                eprintln!("Error removing directory: {}", e);
+    let is_single_dir_mode = args.paths.len() == 1 && Path::new(&args.paths[0]).is_dir();
+
+    if is_single_dir_mode {
+        let input_path = PathBuf::from(&args.paths[0]);
+        let target_dir: PathBuf;
+
+        if args.replace {
+            target_dir = input_path.clone();
+            if !args.silent { println!("Mode: \x1b[31mREPLACE\x1b[0m (Overwriting files in {:?})", target_dir); }
+        } else {
+            let root_name = input_path.file_name().unwrap_or_default().to_string_lossy();
+            let new_name = format!("{}__optimized", root_name);
+            target_dir = input_path.parent().unwrap_or(Path::new(".")).join(new_name);
+            
+            if target_dir.exists() {
+                if !args.silent { println!("Cleaning up existing output directory: {:?}", target_dir); }
+                if let Err(e) = fs::remove_dir_all(&target_dir) {
+                    eprintln!("Error removing directory: {}", e);
+                    return;
+                }
+            }
+
+            if !args.silent { println!("Mode: \x1b[32mSAFE\x1b[0m (Copying to {:?})", target_dir); }
+            let copy_start = Instant::now();
+            if let Err(e) = copy_dir_recursive(&input_path, &target_dir) {
+                eprintln!("Error copying directory: {}", e);
                 return;
             }
+            copy_duration = copy_start.elapsed();
+            if !args.silent { println!("Copy complete in {:.2?}", copy_duration); }
         }
 
-        if !args.silent { println!("Mode: \x1b[32mSAFE\x1b[0m (Copying to {:?})", target_dir); }
+        if !args.silent { println!("Scanning directory: {:?}", target_dir); }
+        let scanned: Vec<(PathBuf, PathBuf)> = WalkDir::new(&target_dir)
+            .into_iter()
+            .filter_map(|e| e.ok())
+            .filter(|e| {
+                e.path().extension()
+                    .map(|ext| supported_exts.contains(&ext.to_string_lossy().to_lowercase().as_str()))
+                    .unwrap_or(false)
+            })
+            .map(|e| {
+                let p = e.into_path();
+                (p.clone(), p)
+            })
+            .collect();
+        files_to_process.extend(scanned);
+
+    } else {
+        if !args.silent { println!("Mode: Specific File List Processing"); }
         let copy_start = Instant::now();
-        if let Err(e) = copy_dir_recursive(&input_path, &target_dir) {
-            eprintln!("Error copying directory: {}", e);
-            return;
+        
+        for p_str in &args.paths {
+            let path = Path::new(p_str);
+            if !path.exists() {
+                if !args.silent { eprintln!("Skipping not found: {:?}", path); }
+                continue;
+            }
+            if path.is_dir() {
+                if !args.silent { eprintln!("Skipping directory in list mode (use single path for recursive dir): {:?}", path); }
+                continue;
+            }
+            
+            let ext = path.extension().unwrap_or(OsStr::new("")).to_string_lossy().to_lowercase();
+            if !supported_exts.contains(&ext.as_str()) {
+                if !args.silent { eprintln!("Skipping unsupported type: {:?}", path); }
+                continue;
+            }
+
+            let target_path = if args.replace {
+                path.to_path_buf()
+            } else {
+                let stem = path.file_stem().unwrap_or_default().to_string_lossy();
+                let new_name = format!("{}__optimized.{}", stem, ext);
+                path.parent().unwrap_or(Path::new(".")).join(new_name)
+            };
+
+            let naming_base = if args.replace {
+                target_path.clone()
+            } else {
+                path.to_path_buf()
+            };
+
+            if !args.replace {
+                if let Err(e) = fs::copy(path, &target_path) {
+                    eprintln!("Error creating safe copy for {:?}: {}", path, e);
+                    continue;
+                }
+            }
+            files_to_process.push((target_path, naming_base));
         }
-        copy_duration = copy_start.elapsed();
-        if !args.silent { println!("Copy complete in {:.2?}", copy_duration); }
+        
+        if !args.replace {
+            copy_duration = copy_start.elapsed();
+        }
     }
 
-    if !args.silent { println!("Scanning directory: {:?}", target_dir); }
-    let scan_start = Instant::now();
-    let supported_exts = ["png", "jpg", "jpeg"];
-    let files: Vec<PathBuf> = WalkDir::new(&target_dir)
-        .into_iter()
-        .filter_map(|e| e.ok())
-        .filter(|e| {
-            e.path().extension()
-                .map(|ext| supported_exts.contains(&ext.to_string_lossy().to_lowercase().as_str()))
-                .unwrap_or(false)
-        })
-        .map(|e| e.into_path())
-        .collect();
     let scan_duration = scan_start.elapsed();
 
-    if files.is_empty() {
-        if !args.silent { println!("No supported files found."); }
+    if files_to_process.is_empty() {
+        if !args.silent { println!("No supported files found to process."); }
         return;
     }
 
-    if !args.silent { println!("Found: {} files. Processing...", files.len()); }
+    if !args.silent { println!("Found: {} files. Processing...", files_to_process.len()); }
     
-    // Progress bar remains even in silent mode
-    let bar = ProgressBar::new(files.len() as u64);
+    let bar = ProgressBar::new(files_to_process.len() as u64);
     bar.set_style(ProgressStyle::with_template("{spinner:.green} [{elapsed_precise}] [{bar:40.cyan/blue}] {pos}/{len}").unwrap().progress_chars("#>-"));
 
     let total_input_size = AtomicU64::new(0);
@@ -277,7 +333,7 @@ fn main() {
 
     let process_start_time = Instant::now();
 
-    files.par_iter().for_each(|path| {
+    files_to_process.par_iter().for_each(|(path, naming_path)| {
         let ext = path.extension().unwrap_or_default().to_string_lossy().to_lowercase();
         let original_file_size = fs::metadata(path).map(|m| m.len()).unwrap_or(0);
         
@@ -287,13 +343,13 @@ fn main() {
             if let Ok(img) = image::open(path) {
                 if args.webp {
                     let t = Instant::now();
-                    let s = generate_webp(&img, path, 75.0, original_file_size);
+                    let s = generate_webp(&img, naming_path, 75.0, original_file_size);
                     time_webp.fetch_add(t.elapsed().as_millis() as u64, Ordering::Relaxed);
                     saved_webp.fetch_add(s, Ordering::Relaxed);
                 }
                 if args.avif {
                     let t = Instant::now();
-                    let s = generate_avif(&img, path, original_file_size);
+                    let s = generate_avif(&img, naming_path, original_file_size);
                     time_avif.fetch_add(t.elapsed().as_millis() as u64, Ordering::Relaxed);
                     saved_avif.fetch_add(s, Ordering::Relaxed);
                 }
@@ -334,7 +390,6 @@ fn main() {
     let t_webp = time_webp.load(Ordering::Relaxed);
     let t_avif = time_avif.load(Ordering::Relaxed);
 
-    // Show stats and wait for Enter ONLY if NOT silent
     if !args.silent {
         println!("\n📊 Final Results:");
         
@@ -345,9 +400,11 @@ fn main() {
         println!("   Total input size:    {}", format_size(total_in, DECIMAL));
         println!("   Total wall time:     {:.2?}", total_duration);
         if !args.replace {
-            println!("     L Copying time:    {:.2?}", copy_duration);
+            println!("     L Copy/Prep time:  {:.2?}", copy_duration);
         }
-        println!("     L Scan time:       {:.2?}", scan_duration);
+        if is_single_dir_mode {
+            println!("     L Scan time:       {:.2?}", scan_duration);
+        }
         println!("     L Processing time: {:.2?}", process_duration);
         println!("   ------------------------------------------------");
         
@@ -363,7 +420,7 @@ fn main() {
                 format_size(total_in - s_webp, DECIMAL), 
                 calc_perc(s_webp)
             );
-            println!("     L Time taken:          {:.2}s", t_webp as f64 / 1000.0);
+            println!("     L Cumulative Time:     {:.2}s", t_webp as f64 / 1000.0);
         }
         
         if args.avif {
@@ -371,7 +428,7 @@ fn main() {
                 format_size(total_in - s_avif, DECIMAL), 
                 calc_perc(s_avif)
             );
-            println!("     L Time taken:          {:.2}s", t_avif as f64 / 1000.0);
+            println!("     L Cumulative Time:     {:.2}s", t_avif as f64 / 1000.0);
         }
         
         println!("\n   * Note: 'Cumulative Time' represents the sum of work across all CPU cores.");
