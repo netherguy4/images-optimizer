@@ -39,6 +39,10 @@ struct Args {
 
     #[arg(long)]
     replace: bool,
+
+    /// Silent mode: shows only progress bar, no stats, no wait for enter
+    #[arg(short = 'S', long)]
+    silent: bool,
 }
 
 fn unpack_png_tools() -> Result<(TempDir, PathBuf, PathBuf), std::io::Error> {
@@ -189,14 +193,15 @@ fn main() {
     let args = Args::parse();
     let total_start_time = Instant::now();
 
-    if args.avif {
+    // Show warnings only if NOT silent
+    if args.avif && !args.silent {
         println!("\x1b[93m⚠️  WARNING: AVIF encoding is active.\x1b[0m");
         println!("\x1b[93m   This process is extremely CPU intensive and may take significantly longer.\x1b[0m");
         println!("\x1b[93m   Ensure your system has adequate cooling and power.\x1b[0m");
         println!("------------------------------------------------");
     }
 
-    println!("Preparing tools...");
+    if !args.silent { println!("Preparing tools..."); }
     let (_tmp, pq, oxi) = match unpack_png_tools() {
         Ok(t) => t,
         Err(e) => { eprintln!("{}", e); return; }
@@ -209,31 +214,31 @@ fn main() {
     if args.replace {
         target_dir = input_path.clone();
         copy_duration = std::time::Duration::new(0, 0);
-        println!("Mode: \x1b[31mREPLACE\x1b[0m (Overwriting files in {:?})", target_dir);
+        if !args.silent { println!("Mode: \x1b[31mREPLACE\x1b[0m (Overwriting files in {:?})", target_dir); }
     } else {
         let root_name = input_path.file_name().unwrap_or_default().to_string_lossy();
         let new_name = format!("{}__optimized", root_name);
         target_dir = input_path.parent().unwrap_or(Path::new(".")).join(new_name);
         
         if target_dir.exists() {
-            println!("Cleaning up existing output directory: {:?}", target_dir);
+            if !args.silent { println!("Cleaning up existing output directory: {:?}", target_dir); }
             if let Err(e) = fs::remove_dir_all(&target_dir) {
                 eprintln!("Error removing directory: {}", e);
                 return;
             }
         }
 
-        println!("Mode: \x1b[32mSAFE\x1b[0m (Copying to {:?})", target_dir);
+        if !args.silent { println!("Mode: \x1b[32mSAFE\x1b[0m (Copying to {:?})", target_dir); }
         let copy_start = Instant::now();
         if let Err(e) = copy_dir_recursive(&input_path, &target_dir) {
             eprintln!("Error copying directory: {}", e);
             return;
         }
         copy_duration = copy_start.elapsed();
-        println!("Copy complete in {:.2?}", copy_duration);
+        if !args.silent { println!("Copy complete in {:.2?}", copy_duration); }
     }
 
-    println!("Scanning directory: {:?}", target_dir);
+    if !args.silent { println!("Scanning directory: {:?}", target_dir); }
     let scan_start = Instant::now();
     let supported_exts = ["png", "jpg", "jpeg"];
     let files: Vec<PathBuf> = WalkDir::new(&target_dir)
@@ -249,11 +254,13 @@ fn main() {
     let scan_duration = scan_start.elapsed();
 
     if files.is_empty() {
-        println!("No supported files found.");
+        if !args.silent { println!("No supported files found."); }
         return;
     }
 
-    println!("Found: {} files. Processing...", files.len());
+    if !args.silent { println!("Found: {} files. Processing...", files.len()); }
+    
+    // Progress bar remains even in silent mode
     let bar = ProgressBar::new(files.len() as u64);
     bar.set_style(ProgressStyle::with_template("{spinner:.green} [{elapsed_precise}] [{bar:40.cyan/blue}] {pos}/{len}").unwrap().progress_chars("#>-"));
 
@@ -308,7 +315,12 @@ fn main() {
         bar.inc(1);
     });
 
-    bar.finish_with_message("Done");
+    if args.silent {
+        bar.finish_and_clear();
+    } else {
+        bar.finish_with_message("Done");
+    }
+
     let process_duration = process_start_time.elapsed();
     let total_duration = total_start_time.elapsed();
 
@@ -322,47 +334,50 @@ fn main() {
     let t_webp = time_webp.load(Ordering::Relaxed);
     let t_avif = time_avif.load(Ordering::Relaxed);
 
-    println!("\n📊 Final Results:");
-    
-    let calc_perc = |saved: u64| -> f64 {
-        if total_in > 0 { (saved as f64 / total_in as f64) * 100.0 } else { 0.0 }
-    };
+    // Show stats and wait for Enter ONLY if NOT silent
+    if !args.silent {
+        println!("\n📊 Final Results:");
+        
+        let calc_perc = |saved: u64| -> f64 {
+            if total_in > 0 { (saved as f64 / total_in as f64) * 100.0 } else { 0.0 }
+        };
 
-    println!("   Total input size:    {}", format_size(total_in, DECIMAL));
-    println!("   Total wall time:     {:.2?}", total_duration);
-    if !args.replace {
-        println!("     L Copying time:    {:.2?}", copy_duration);
-    }
-    println!("     L Scan time:       {:.2?}", scan_duration);
-    println!("     L Processing time: {:.2?}", process_duration);
-    println!("   ------------------------------------------------");
-    
-    println!("   Optimization (JPG/PNG): {} (🔻{:.1}%)", 
-        format_size(total_in - s_orig, DECIMAL), 
-        calc_perc(s_orig)
-    );
-    if t_jpg > 0 { println!("     L JPG Cumulative Time: {:.2}s", t_jpg as f64 / 1000.0); }
-    if t_png > 0 { println!("     L PNG Cumulative Time: {:.2}s", t_png as f64 / 1000.0); }
-    
-    if args.webp {
-        println!("   WebP Generation:        {} (🔻{:.1}%)", 
-            format_size(total_in - s_webp, DECIMAL), 
-            calc_perc(s_webp)
+        println!("   Total input size:    {}", format_size(total_in, DECIMAL));
+        println!("   Total wall time:     {:.2?}", total_duration);
+        if !args.replace {
+            println!("     L Copying time:    {:.2?}", copy_duration);
+        }
+        println!("     L Scan time:       {:.2?}", scan_duration);
+        println!("     L Processing time: {:.2?}", process_duration);
+        println!("   ------------------------------------------------");
+        
+        println!("   Optimization (JPG/PNG): {} (🔻{:.1}%)", 
+            format_size(total_in - s_orig, DECIMAL), 
+            calc_perc(s_orig)
         );
-        println!("     L Time taken:          {:.2}s", t_webp as f64 / 1000.0);
-    }
-    
-    if args.avif {
-        println!("   AVIF Generation:        {} (🔻{:.1}%)", 
-            format_size(total_in - s_avif, DECIMAL), 
-            calc_perc(s_avif)
-        );
-        println!("     L Time taken:          {:.2}s", t_avif as f64 / 1000.0);
-    }
-    
-    println!("\n   * Note: 'Cumulative Time' represents the sum of work across all CPU cores.");
-    println!("     It differs from 'Wall time' due to parallel processing.");
+        if t_jpg > 0 { println!("     L JPG Cumulative Time: {:.2}s", t_jpg as f64 / 1000.0); }
+        if t_png > 0 { println!("     L PNG Cumulative Time: {:.2}s", t_png as f64 / 1000.0); }
+        
+        if args.webp {
+            println!("   WebP Generation:        {} (🔻{:.1}%)", 
+                format_size(total_in - s_webp, DECIMAL), 
+                calc_perc(s_webp)
+            );
+            println!("     L Time taken:          {:.2}s", t_webp as f64 / 1000.0);
+        }
+        
+        if args.avif {
+            println!("   AVIF Generation:        {} (🔻{:.1}%)", 
+                format_size(total_in - s_avif, DECIMAL), 
+                calc_perc(s_avif)
+            );
+            println!("     L Time taken:          {:.2}s", t_avif as f64 / 1000.0);
+        }
+        
+        println!("\n   * Note: 'Cumulative Time' represents the sum of work across all CPU cores.");
+        println!("     It differs from 'Wall time' due to parallel processing.");
 
-    println!("\nPress Enter to exit...");
-    let _ = std::io::stdin().read_line(&mut String::new());
+        println!("\nPress Enter to exit...");
+        let _ = std::io::stdin().read_line(&mut String::new());
+    }
 }
