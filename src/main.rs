@@ -1,4 +1,4 @@
-use clap::Parser;
+use clap::{Parser, ValueHint};
 use console::Term;
 use humansize::{format_size, DECIMAL};
 use indicatif::{ProgressBar, ProgressStyle};
@@ -19,29 +19,56 @@ const PNGQUANT_BIN: &[u8] = include_bytes!("../bin/pngquant.exe");
 const OXIPNG_BIN: &[u8] = include_bytes!("../bin/oxipng.exe");
 
 #[derive(Parser, Debug)]
-#[command(author, version, about)]
+#[command(
+    author, 
+    version, 
+    about = "High-performance parallel image optimizer.",
+    long_about = "A multi-threaded CLI tool designed to compress JPG and PNG images recursively.\n\nIt utilizes mozjpeg, pngquant, and oxipng to reduce file sizes while preserving visual quality. It can also optionally generate next-gen WebP and AVIF formats."
+)]
 struct Args {
-    #[arg(default_value = ".", value_delimiter = ',', num_args = 1..)]
+    /// List of files or directories to process.
+    /// 
+    /// If a directory is provided, the tool will scan it recursively for .png, .jpg, and .jpeg files.
+    #[arg(default_value = ".", value_delimiter = ',', num_args = 1.., value_hint = ValueHint::AnyPath)]
     paths: Vec<String>,
 
-    #[arg(long, default_value_t = 80)]
+    /// Target JPEG quality (0-100).
+    /// 
+    /// Lower values result in smaller files but lower visual quality.
+    #[arg(long, default_value_t = 80, value_parser = clap::value_parser!(u8).range(1..=100), help_heading = "Quality Settings")]
     jpg_q: u8,
 
-    #[arg(long, default_value_t = 65)]
+    /// Minimum PNG quality allowed (0-100).
+    /// 
+    /// Used by pngquant. If the image cannot be compressed to this quality with the
+    /// specified max quality, the conversion is skipped.
+    #[arg(long, default_value_t = 65, value_parser = clap::value_parser!(u8).range(1..=100), help_heading = "Quality Settings")]
     png_min: u8,
 
-    #[arg(long, default_value_t = 80)]
+    /// Maximum PNG quality allowed (0-100).
+    /// 
+    /// Used by pngquant to determine the amount of lossy compression.
+    #[arg(long, default_value_t = 80, value_parser = clap::value_parser!(u8).range(1..=100), help_heading = "Quality Settings")]
     png_max: u8,
 
-    #[arg(long)]
+    /// Generate WebP versions alongside originals.
+    #[arg(long, help_heading = "Format Generation")]
     webp: bool,
 
-    #[arg(long)]
+    /// Generate AVIF versions alongside originals.
+    /// 
+    /// WARNING: AVIF encoding is extremely CPU intensive and slow.
+    #[arg(long, help_heading = "Format Generation")]
     avif: bool,
 
+    /// Overwrite original files in place.
+    /// 
+    /// If not set, files are copied to a new directory (e.g., folder_optimized).
+    /// USE WITH CAUTION.
     #[arg(long)]
     replace: bool,
 
+    /// Suppress all standard output (progress bars and summaries).
     #[arg(short = 'S', long)]
     silent: bool,
 }
