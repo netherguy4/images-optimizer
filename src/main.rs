@@ -1,5 +1,5 @@
 use clap::{Parser, ValueHint};
-use console::Term;
+use console::{style, Term}; // Imported 'style' here
 use humansize::{format_size, DECIMAL};
 use indicatif::{ProgressBar, ProgressStyle};
 use rayon::prelude::*;
@@ -219,13 +219,16 @@ fn generate_avif(img: &image::DynamicImage, path: &Path, original_size: u64) -> 
 }
 
 fn main() {
+    // REMOVED: The invalid console::enable_ansi_support call. 
+    // console::style() automatically handles terminal modes.
+
     let args = Args::parse();
     let total_start_time = Instant::now();
 
     if args.avif && !args.silent {
-        println!("\x1b[93m⚠️  WARNING: AVIF encoding is active.\x1b[0m");
-        println!("\x1b[93m   This process is extremely CPU intensive and may take significantly longer.\x1b[0m");
-        println!("\x1b[93m   Ensure your system has adequate cooling and power.\x1b[0m");
+        println!("{}", style("⚠️  WARNING: AVIF encoding is active.").yellow());
+        println!("{}", style("   This process is extremely CPU intensive and may take significantly longer.").yellow());
+        println!("{}", style("   Ensure your system has adequate cooling and power.").yellow());
         println!("------------------------------------------------");
     }
 
@@ -248,7 +251,9 @@ fn main() {
 
         if args.replace {
             target_dir = input_path.clone();
-            if !args.silent { println!("Mode: \x1b[31mREPLACE\x1b[0m (Overwriting files in {:?})", target_dir); }
+            if !args.silent { 
+                println!("Mode: {} (Overwriting files in {:?})", style("REPLACE").red(), target_dir); 
+            }
         } else {
             let root_name = input_path.file_name().unwrap_or_default().to_string_lossy();
             let new_name = format!("{}__optimized", root_name);
@@ -262,7 +267,9 @@ fn main() {
                 }
             }
 
-            if !args.silent { println!("Mode: \x1b[32mSAFE\x1b[0m (Copying to {:?})", target_dir); }
+            if !args.silent { 
+                println!("Mode: {} (Copying to {:?})", style("SAFE").green(), target_dir); 
+            }
             let copy_start = Instant::now();
             if let Err(e) = copy_dir_recursive(&input_path, &target_dir) {
                 eprintln!("Error copying directory: {}", e);
