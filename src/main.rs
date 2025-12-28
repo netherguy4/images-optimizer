@@ -36,6 +36,9 @@ struct Args {
 
     #[arg(long)]
     avif: bool,
+
+    #[arg(long)]
+    replace: bool,
 }
 
 fn unpack_png_tools() -> Result<(TempDir, PathBuf, PathBuf), std::io::Error> {
@@ -47,6 +50,23 @@ fn unpack_png_tools() -> Result<(TempDir, PathBuf, PathBuf), std::io::Error> {
     let mut f2 = fs::File::create(&oxi_path)?;
     f2.write_all(OXIPNG_BIN)?;
     Ok((dir, pq_path, oxi_path))
+}
+
+fn copy_dir_recursive(src: &Path, dst: &Path) -> std::io::Result<()> {
+    if !dst.exists() {
+        fs::create_dir_all(dst)?;
+    }
+    for entry in fs::read_dir(src)? {
+        let entry = entry?;
+        let ty = entry.file_type()?;
+        let dst_path = dst.join(entry.file_name());
+        if ty.is_dir() {
+            copy_dir_recursive(&entry.path(), &dst_path)?;
+        } else {
+            fs::copy(entry.path(), &dst_path)?;
+        }
+    }
+    Ok(())
 }
 
 fn process_jpg(path: &Path, quality: u8) -> u64 {
@@ -169,16 +189,54 @@ fn main() {
     let args = Args::parse();
     let total_start_time = Instant::now();
 
-    println!("Preparing...");
+    if args.avif {
+        println!("\x1b[93m⚠️  WARNING: AVIF encoding is active.\x1b[0m");
+        println!("\x1b[93m   This process is extremely CPU intensive and may take significantly longer.\x1b[0m");
+        println!("\x1b[93m   Ensure your system has adequate cooling and power.\x1b[0m");
+        println!("------------------------------------------------");
+    }
+
+    println!("Preparing tools...");
     let (_tmp, pq, oxi) = match unpack_png_tools() {
         Ok(t) => t,
         Err(e) => { eprintln!("{}", e); return; }
     };
 
-    println!("Scanning: {}", args.path);
+    let input_path = PathBuf::from(&args.path);
+    let target_dir: PathBuf;
+    let copy_duration;
+
+    if args.replace {
+        target_dir = input_path.clone();
+        copy_duration = std::time::Duration::new(0, 0);
+        println!("Mode: \x1b[31mREPLACE\x1b[0m (Overwriting files in {:?})", target_dir);
+    } else {
+        let root_name = input_path.file_name().unwrap_or_default().to_string_lossy();
+        let new_name = format!("{}__optimized", root_name);
+        target_dir = input_path.parent().unwrap_or(Path::new(".")).join(new_name);
+        
+        if target_dir.exists() {
+            println!("Cleaning up existing output directory: {:?}", target_dir);
+            if let Err(e) = fs::remove_dir_all(&target_dir) {
+                eprintln!("Error removing directory: {}", e);
+                return;
+            }
+        }
+
+        println!("Mode: \x1b[32mSAFE\x1b[0m (Copying to {:?})", target_dir);
+        let copy_start = Instant::now();
+        if let Err(e) = copy_dir_recursive(&input_path, &target_dir) {
+            eprintln!("Error copying directory: {}", e);
+            return;
+        }
+        copy_duration = copy_start.elapsed();
+        println!("Copy complete in {:.2?}", copy_duration);
+    }
+
+    println!("Scanning directory: {:?}", target_dir);
     let scan_start = Instant::now();
     let supported_exts = ["png", "jpg", "jpeg"];
-    let files: Vec<PathBuf> = WalkDir::new(&args.path)
+    let files: Vec<PathBuf> = WalkDir::new(&target_dir)
         .into_iter()
         .filter_map(|e| e.ok())
         .filter(|e| {
@@ -191,11 +249,11 @@ fn main() {
     let scan_duration = scan_start.elapsed();
 
     if files.is_empty() {
-        println!("No files found.");
+        println!("No supported files found.");
         return;
     }
 
-    println!("Found: {} files. Processing (Scan time: {:.2?})...", files.len(), scan_duration);
+    println!("Found: {} files. Processing...", files.len());
     let bar = ProgressBar::new(files.len() as u64);
     bar.set_style(ProgressStyle::with_template("{spinner:.green} [{elapsed_precise}] [{bar:40.cyan/blue}] {pos}/{len}").unwrap().progress_chars("#>-"));
 
@@ -272,7 +330,11 @@ fn main() {
 
     println!("   Total input size:    {}", format_size(total_in, DECIMAL));
     println!("   Total wall time:     {:.2?}", total_duration);
-    println!("   Processing duration: {:.2?}", process_duration);
+    if !args.replace {
+        println!("     L Copying time:    {:.2?}", copy_duration);
+    }
+    println!("     L Scan time:       {:.2?}", scan_duration);
+    println!("     L Processing time: {:.2?}", process_duration);
     println!("   ------------------------------------------------");
     
     println!("   Optimization (JPG/PNG): {} (🔻{:.1}%)", 
@@ -298,6 +360,9 @@ fn main() {
         println!("     L Time taken:          {:.2}s", t_avif as f64 / 1000.0);
     }
     
+    println!("\n   * Note: 'Cumulative Time' represents the sum of work across all CPU cores.");
+    println!("     It differs from 'Wall time' due to parallel processing.");
+
     println!("\nPress Enter to exit...");
     let _ = std::io::stdin().read_line(&mut String::new());
 }
