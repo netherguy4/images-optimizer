@@ -219,23 +219,20 @@ fn generate_avif(img: &image::DynamicImage, path: &Path, original_size: u64) -> 
 }
 
 fn main() {
-    // REMOVED: The invalid console::enable_ansi_support call. 
-    // console::style() automatically handles terminal modes.
-
     let args = Args::parse();
     let total_start_time = Instant::now();
 
     if args.avif && !args.silent {
-        println!("{}", style("⚠️  WARNING: AVIF encoding is active.").yellow());
-        println!("{}", style("   This process is extremely CPU intensive and may take significantly longer.").yellow());
-        println!("{}", style("   Ensure your system has adequate cooling and power.").yellow());
-        println!("------------------------------------------------");
+        println!("{}", style("[!] WARNING: AVIF encoding is active.").red().bold());
+        println!("{}", style("    This process is extremely CPU intensive and may take significantly longer.").yellow());
+        println!("{}", style("    Ensure your system has adequate cooling and power.").yellow());
+        println!("{}", style("------------------------------------------------").dim());
     }
 
-    if !args.silent { println!("Preparing tools..."); }
+    if !args.silent { println!("{}", style("Preparing tools...").cyan()); }
     let (_tmp_dir, pq, oxi) = match get_png_tools() {
         Ok(t) => t,
-        Err(e) => { eprintln!("{}", e); return; }
+        Err(e) => { eprintln!("{}", style(e).red()); return; }
     };
 
     let supported_exts = ["png", "jpg", "jpeg"];
@@ -252,7 +249,7 @@ fn main() {
         if args.replace {
             target_dir = input_path.clone();
             if !args.silent { 
-                println!("Mode: {} (Overwriting files in {:?})", style("REPLACE").red(), target_dir); 
+                println!("Mode: {} (Overwriting files in {})", style("REPLACE").red().bold(), style(target_dir.to_string_lossy()).cyan()); 
             }
         } else {
             let root_name = input_path.file_name().unwrap_or_default().to_string_lossy();
@@ -260,26 +257,28 @@ fn main() {
             target_dir = input_path.parent().unwrap_or(Path::new(".")).join(new_name);
             
             if target_dir.exists() {
-                if !args.silent { println!("Cleaning up existing output directory: {:?}", target_dir); }
+                if !args.silent { println!("{}", style(format!("Cleaning up existing output directory: {:?}", target_dir)).dim()); }
                 if let Err(e) = fs::remove_dir_all(&target_dir) {
-                    eprintln!("Error removing directory: {}", e);
+                    eprintln!("{} {}", style("Error removing directory:").red(), e);
                     return;
                 }
             }
 
             if !args.silent { 
-                println!("Mode: {} (Copying to {:?})", style("SAFE").green(), target_dir); 
+                println!("Mode: {} (Copying to {})", style("SAFE").green().bold(), style(target_dir.to_string_lossy()).cyan()); 
             }
             let copy_start = Instant::now();
             if let Err(e) = copy_dir_recursive(&input_path, &target_dir) {
-                eprintln!("Error copying directory: {}", e);
+                eprintln!("{} {}", style("Error copying directory:").red(), e);
                 return;
             }
             copy_duration = copy_start.elapsed();
-            if !args.silent { println!("Copy complete in {:.2?}", copy_duration); }
+            if !args.silent { println!("Copy complete in {}", style(format!("{:.2?}", copy_duration)).yellow()); }
         }
 
-        if !args.silent { println!("Scanning directory: {:?}", target_dir); }
+        if !args.silent { 
+            println!("Scanning directory: {}", style(target_dir.to_string_lossy()).cyan()); 
+        }
         let scanned: Vec<(PathBuf, PathBuf)> = WalkDir::new(&target_dir)
             .into_iter()
             .filter_map(|e| e.ok())
@@ -296,23 +295,23 @@ fn main() {
         files_to_process.extend(scanned);
 
     } else {
-        if !args.silent { println!("Mode: Specific File List Processing"); }
+        if !args.silent { println!("Mode: {}", style("Specific File List Processing").magenta()); }
         let copy_start = Instant::now();
         
         for p_str in &args.paths {
             let path = Path::new(p_str);
             if !path.exists() {
-                if !args.silent { eprintln!("Skipping not found: {:?}", path); }
+                if !args.silent { eprintln!("{}", style(format!("Skipping not found: {:?}", path)).yellow()); }
                 continue;
             }
             if path.is_dir() {
-                if !args.silent { eprintln!("Skipping directory in list mode (use single path for recursive dir): {:?}", path); }
+                if !args.silent { eprintln!("{}", style(format!("Skipping directory in list mode: {:?}", path)).yellow()); }
                 continue;
             }
             
             let ext = path.extension().unwrap_or(OsStr::new("")).to_string_lossy().to_lowercase();
             if !supported_exts.contains(&ext.as_str()) {
-                if !args.silent { eprintln!("Skipping unsupported type: {:?}", path); }
+                if !args.silent { eprintln!("{}", style(format!("Skipping unsupported type: {:?}", path)).yellow()); }
                 continue;
             }
 
@@ -332,7 +331,7 @@ fn main() {
 
             if !args.replace {
                 if let Err(e) = fs::copy(path, &target_path) {
-                    eprintln!("Error creating safe copy for {:?}: {}", path, e);
+                    eprintln!("{} {:?}: {}", style("Error creating safe copy for").red(), path, e);
                     continue;
                 }
             }
@@ -347,14 +346,17 @@ fn main() {
     let scan_duration = scan_start.elapsed();
 
     if files_to_process.is_empty() {
-        if !args.silent { println!("No supported files found to process."); }
+        if !args.silent { println!("{}", style("No supported files found to process.").red()); }
         return;
     }
 
-    if !args.silent { println!("Found: {} files. Processing...", files_to_process.len()); }
+    if !args.silent { println!("Found: {} files. Processing...", style(files_to_process.len()).bold().yellow()); }
     
     let bar = ProgressBar::new(files_to_process.len() as u64);
-    bar.set_style(ProgressStyle::with_template("{spinner:.green} [{elapsed_precise}] [{bar:40.cyan/blue}] {pos}/{len}").unwrap().progress_chars("#>-"));
+    bar.set_style(ProgressStyle::with_template("{spinner:.green} [{elapsed_precise:.bold}] [{bar:40.cyan/white}] {pos}/{len} ({eta})")
+        .unwrap()
+        .tick_chars("|/-\\ ")
+        .progress_chars("#>-"));
 
     let total_input_size = AtomicU64::new(0);
     
@@ -410,7 +412,7 @@ fn main() {
     if args.silent {
         bar.finish_and_clear();
     } else {
-        bar.finish_with_message("Done");
+        bar.finish_with_message(format!("{}", style("Done").green().bold()));
     }
 
     let process_duration = process_start_time.elapsed();
@@ -427,48 +429,48 @@ fn main() {
     let t_avif = time_avif.load(Ordering::Relaxed);
 
     if !args.silent {
-        println!("\n📊 Final Results:");
+        println!("\n{}", style("=== Final Results ===").bold().magenta());
         
         let calc_perc = |saved: u64| -> f64 {
             if total_in > 0 { (saved as f64 / total_in as f64) * 100.0 } else { 0.0 }
         };
 
-        println!("   Total input size:    {}", format_size(total_in, DECIMAL));
-        println!("   Total wall time:     {:.2?}", total_duration);
+        println!("    Total input size:    {}", style(format_size(total_in, DECIMAL)).cyan().bold());
+        println!("    Total wall time:     {}", style(format!("{:.2?}", total_duration)).yellow());
         if !args.replace {
-            println!("     L Copy/Prep time:  {:.2?}", copy_duration);
+            println!("      L Copy/Prep time:   {}", style(format!("{:.2?}", copy_duration)).dim());
         }
         if is_single_dir_mode {
-            println!("     L Scan time:       {:.2?}", scan_duration);
+            println!("      L Scan time:        {}", style(format!("{:.2?}", scan_duration)).dim());
         }
-        println!("     L Processing time: {:.2?}", process_duration);
-        println!("   ------------------------------------------------");
+        println!("      L Processing time: {}", style(format!("{:.2?}", process_duration)).yellow());
+        println!("{}", style("    ------------------------------------------------").dim());
         
-        println!("   Optimization (JPG/PNG): {} (🔻{:.1}%)", 
-            format_size(total_in - s_orig, DECIMAL), 
-            calc_perc(s_orig)
+        println!("    Optimization (JPG/PNG): {} ({})", 
+            style(format_size(total_in - s_orig, DECIMAL)).green().bold(), 
+            style(format!("-{:.1}%", calc_perc(s_orig))).green()
         );
-        if t_jpg > 0 { println!("     L JPG Cumulative Time: {:.2}s", t_jpg as f64 / 1000.0); }
-        if t_png > 0 { println!("     L PNG Cumulative Time: {:.2}s", t_png as f64 / 1000.0); }
+        if t_jpg > 0 { println!("      L JPG Cumulative Time: {:.2}s", t_jpg as f64 / 1000.0); }
+        if t_png > 0 { println!("      L PNG Cumulative Time: {:.2}s", t_png as f64 / 1000.0); }
         
         if args.webp {
-            println!("   WebP Generation:        {} (🔻{:.1}%)", 
-                format_size(total_in - s_webp, DECIMAL), 
-                calc_perc(s_webp)
+            println!("    WebP Generation:        {} ({})", 
+                style(format_size(total_in - s_webp, DECIMAL)).green().bold(), 
+                style(format!("-{:.1}%", calc_perc(s_webp))).green()
             );
-            println!("     L Cumulative Time:     {:.2}s", t_webp as f64 / 1000.0);
+            println!("      L Cumulative Time:      {:.2}s", t_webp as f64 / 1000.0);
         }
         
         if args.avif {
-            println!("   AVIF Generation:        {} (🔻{:.1}%)", 
-                format_size(total_in - s_avif, DECIMAL), 
-                calc_perc(s_avif)
+            println!("    AVIF Generation:        {} ({})", 
+                style(format_size(total_in - s_avif, DECIMAL)).green().bold(), 
+                style(format!("-{:.1}%", calc_perc(s_avif))).green()
             );
-            println!("     L Cumulative Time:     {:.2}s", t_avif as f64 / 1000.0);
+            println!("      L Cumulative Time:      {:.2}s", t_avif as f64 / 1000.0);
         }
         
-        println!("\n   * Note: 'Cumulative Time' represents the sum of work across all CPU cores.");
-        println!("     It differs from 'Wall time' due to parallel processing.");
+        println!("\n{}", style("    * Note: 'Cumulative Time' represents the sum of work across all CPU cores.").dim().italic());
+        println!("{}", style("      It differs from 'Wall time' due to parallel processing.").dim().italic());
 
         println!("\nPress any key to exit...");
         let term = Term::stdout();
