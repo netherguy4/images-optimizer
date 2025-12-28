@@ -1,4 +1,5 @@
 use clap::Parser;
+use console::Term;
 use humansize::{format_size, DECIMAL};
 use indicatif::{ProgressBar, ProgressStyle};
 use rayon::prelude::*;
@@ -434,7 +435,8 @@ fn main() {
         println!("\n   * Note: 'Cumulative Time' represents the sum of work across all CPU cores.");
         println!("     It differs from 'Wall time' due to parallel processing.");
 
-        println!("\nPress Enter to exit...");
-        let _ = std::io::stdin().read_line(&mut String::new());
+        println!("\nPress any key to exit...");
+        let term = Term::stdout();
+        let _ = term.read_char();
     }
 }
