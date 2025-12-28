@@ -15,7 +15,9 @@ use walkdir::WalkDir;
 use image::GenericImageView;
 use rgb::FromSlice; 
 
+#[cfg(target_os = "windows")]
 const PNGQUANT_BIN: &[u8] = include_bytes!("../bin/pngquant.exe");
+#[cfg(target_os = "windows")]
 const OXIPNG_BIN: &[u8] = include_bytes!("../bin/oxipng.exe");
 
 #[derive(Parser, Debug)]
@@ -26,62 +28,61 @@ const OXIPNG_BIN: &[u8] = include_bytes!("../bin/oxipng.exe");
     long_about = "A multi-threaded CLI tool designed to compress JPG and PNG images recursively.\n\nIt utilizes mozjpeg, pngquant, and oxipng to reduce file sizes while preserving visual quality. It can also optionally generate next-gen WebP and AVIF formats."
 )]
 struct Args {
-    /// List of files or directories to process.
-    /// 
-    /// If a directory is provided, the tool will scan it recursively for .png, .jpg, and .jpeg files.
-    #[arg(default_value = ".", value_delimiter = ',', num_args = 1.., value_hint = ValueHint::AnyPath)]
+    #[arg(default_value = ".", value_delimiter = ',', num_args = 1.., value_hint = ValueHint::AnyPath, help = "List of files or directories to process.")]
     paths: Vec<String>,
 
-    /// Target JPEG quality (0-100).
-    /// 
-    /// Lower values result in smaller files but lower visual quality.
-    #[arg(long, default_value_t = 80, value_parser = clap::value_parser!(u8).range(1..=100), help_heading = "Quality Settings")]
+    #[arg(long, default_value_t = 80, value_parser = clap::value_parser!(u8).range(1..=100), help_heading = "Quality Settings", help = "Target JPEG quality (0-100).")]
     jpg_q: u8,
 
-    /// Minimum PNG quality allowed (0-100).
-    /// 
-    /// Used by pngquant. If the image cannot be compressed to this quality with the
-    /// specified max quality, the conversion is skipped.
-    #[arg(long, default_value_t = 65, value_parser = clap::value_parser!(u8).range(1..=100), help_heading = "Quality Settings")]
+    #[arg(long, default_value_t = 65, value_parser = clap::value_parser!(u8).range(1..=100), help_heading = "Quality Settings", help = "Minimum PNG quality allowed (0-100).")]
     png_min: u8,
 
-    /// Maximum PNG quality allowed (0-100).
-    /// 
-    /// Used by pngquant to determine the amount of lossy compression.
-    #[arg(long, default_value_t = 80, value_parser = clap::value_parser!(u8).range(1..=100), help_heading = "Quality Settings")]
+    #[arg(long, default_value_t = 80, value_parser = clap::value_parser!(u8).range(1..=100), help_heading = "Quality Settings", help = "Maximum PNG quality allowed (0-100).")]
     png_max: u8,
 
-    /// Generate WebP versions alongside originals.
-    #[arg(long, help_heading = "Format Generation")]
+    #[arg(long, help_heading = "Format Generation", help = "Generate WebP versions alongside originals.")]
     webp: bool,
 
-    /// Generate AVIF versions alongside originals.
-    /// 
-    /// WARNING: AVIF encoding is extremely CPU intensive and slow.
-    #[arg(long, help_heading = "Format Generation")]
+    #[arg(long, help_heading = "Format Generation", help = "Generate AVIF versions alongside originals.")]
     avif: bool,
 
-    /// Overwrite original files in place.
-    /// 
-    /// If not set, files are copied to a new directory (e.g., folder_optimized).
-    /// USE WITH CAUTION.
-    #[arg(long)]
+    #[arg(long, help = "Overwrite original files in place.")]
     replace: bool,
 
-    /// Suppress all standard output (progress bars and summaries).
-    #[arg(short = 'S', long)]
+    #[arg(short = 'S', long, help = "Suppress all standard output.")]
     silent: bool,
 }
 
-fn unpack_png_tools() -> Result<(TempDir, PathBuf, PathBuf), std::io::Error> {
-    let dir = tempfile::tempdir()?;
-    let pq_path = dir.path().join("pngquant.exe");
-    let oxi_path = dir.path().join("oxipng.exe");
-    let mut f1 = fs::File::create(&pq_path)?;
-    f1.write_all(PNGQUANT_BIN)?;
-    let mut f2 = fs::File::create(&oxi_path)?;
-    f2.write_all(OXIPNG_BIN)?;
-    Ok((dir, pq_path, oxi_path))
+enum ToolPath {
+    Path(PathBuf),
+    #[allow(dead_code)]
+    Command(String),
+}
+
+fn get_tool_ref(t: &ToolPath) -> &OsStr {
+    match t {
+        ToolPath::Path(p) => p.as_os_str(),
+        ToolPath::Command(c) => OsStr::new(c),
+    }
+}
+
+fn get_png_tools() -> Result<(Option<TempDir>, ToolPath, ToolPath), std::io::Error> {
+    #[cfg(target_os = "windows")]
+    {
+        let dir = tempfile::tempdir()?;
+        let pq_path = dir.path().join("pngquant.exe");
+        let oxi_path = dir.path().join("oxipng.exe");
+        let mut f1 = fs::File::create(&pq_path)?;
+        f1.write_all(PNGQUANT_BIN)?;
+        let mut f2 = fs::File::create(&oxi_path)?;
+        f2.write_all(OXIPNG_BIN)?;
+        Ok((Some(dir), ToolPath::Path(pq_path), ToolPath::Path(oxi_path)))
+    }
+
+    #[cfg(not(target_os = "windows"))]
+    {
+        Ok((None, ToolPath::Command("pngquant".to_string()), ToolPath::Command("oxipng".to_string())))
+    }
 }
 
 fn copy_dir_recursive(src: &Path, dst: &Path) -> std::io::Result<()> {
@@ -119,7 +120,7 @@ fn process_jpg(path: &Path, quality: u8) -> u64 {
     let mut comp = comp.start_compress(Vec::new()).unwrap();
     
     if comp.write_scanlines(pixels).is_ok() {
-        let compressed_data = match comp.finish_compress() {
+        let compressed_data = match comp.finish() {
             Ok(d) => d,
             Err(_) => return 0,
         };
@@ -135,20 +136,20 @@ fn process_jpg(path: &Path, quality: u8) -> u64 {
     0
 }
 
-fn process_png(path: &Path, pq: &Path, oxi: &Path, min: u8, max: u8) -> u64 {
+fn process_png(path: &Path, pq: &ToolPath, oxi: &ToolPath, min: u8, max: u8) -> u64 {
     let original_size = fs::metadata(path).map(|m| m.len()).unwrap_or(0);
     
     #[cfg(target_os = "windows")]
     use std::os::windows::process::CommandExt;
     const CREATE_NO_WINDOW: u32 = 0x08000000;
 
-    let mut cmd = Command::new(pq);
+    let mut cmd = Command::new(get_tool_ref(pq));
     cmd.args([&format!("--quality={}-{}", min, max), "--speed=3", "--force", "--ext=.png", "--skip-if-larger"]).arg(path);
     #[cfg(target_os = "windows")]
     cmd.creation_flags(CREATE_NO_WINDOW);
     let _ = cmd.output();
 
-    let mut cmd2 = Command::new(oxi);
+    let mut cmd2 = Command::new(get_tool_ref(oxi));
     cmd2.args(["-o", "4", "--strip", "all", "-t", "1"]).arg(path);
     #[cfg(target_os = "windows")]
     cmd2.creation_flags(CREATE_NO_WINDOW);
@@ -229,7 +230,7 @@ fn main() {
     }
 
     if !args.silent { println!("Preparing tools..."); }
-    let (_tmp, pq, oxi) = match unpack_png_tools() {
+    let (_tmp_dir, pq, oxi) = match get_png_tools() {
         Ok(t) => t,
         Err(e) => { eprintln!("{}", e); return; }
     };

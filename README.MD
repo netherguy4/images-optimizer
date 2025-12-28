@@ -2,6 +2,10 @@
 
 A high-performance, multi-threaded command-line tool designed to compress images (PNG, JPEG) and generate modern web formats (WebP, AVIF). Built with Rust for speed, safety, and efficiency.
 
+## ⚠️ Disclaimer
+
+**This tool is heavily optimized for Windows.** While it is written in Rust and theoretically cross-platform, stable operation on Linux and macOS is not guaranteed. If you encounter issues on non-Windows systems, please report them, but prioritize Windows for production use.
+
 ## 📦 Installation & Setup
 
 ### Add to PATH (Recommended)
