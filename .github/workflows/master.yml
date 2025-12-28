@@ -55,18 +55,13 @@ jobs:
       if: runner.os == 'Windows'
       run: choco install nasm
 
-    # FIXED STEP BELOW
     - name: Prepare Windows Binaries
       if: runner.os == 'Windows'
       shell: bash
       run: |
         mkdir -p bin
-        # Download pngquant
         curl -L -o pngquant.zip https://pngquant.org/pngquant-windows.zip 
-        # -j flag added to flatten directory structure (fixes the error)
         unzip -j -o pngquant.zip "*/pngquant.exe" -d bin
-        
-        # Download oxipng
         curl -L -o oxipng.zip https://github.com/shssoichiro/oxipng/releases/download/v9.0.0/oxipng-9.0.0-x86_64-pc-windows-msvc.zip
         unzip -j -o oxipng.zip "*/oxipng.exe" -d bin
 
@@ -74,6 +69,11 @@ jobs:
       uses: dtolnay/rust-toolchain@stable
       with:
         targets: ${{ matrix.target }}
+
+    - name: Rust Cache
+      uses: swatinem/rust-cache@v2
+      with:
+        key: ${{ matrix.target }}
 
     - name: Build Binary
       run: cargo build --release --target ${{ matrix.target }}
