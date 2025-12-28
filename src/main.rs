@@ -10,10 +10,8 @@ use std::sync::atomic::{AtomicU64, Ordering};
 use tempfile::TempDir;
 use walkdir::WalkDir;
 use image::GenericImageView;
-// ВАЖНО: Импортируем FromSlice, чтобы работал .as_rgba()
 use rgb::FromSlice; 
 
-// --- ВСТРАИВАНИЕ (PNG) ---
 const PNGQUANT_BIN: &[u8] = include_bytes!("../bin/pngquant.exe");
 const OXIPNG_BIN: &[u8] = include_bytes!("../bin/oxipng.exe");
 
@@ -107,14 +105,10 @@ fn process_png(path: &Path, pq: &Path, oxi: &Path, min: u8, max: u8) -> u64 {
     if original_size > new_size { original_size - new_size } else { 0 }
 }
 
-// --- ИСПРАВЛЕННАЯ ГЕНЕРАЦИЯ WEBP ---
-fn generate_webp(img: &image::DynamicImage, path: &Path, quality: f32) {
+fn generate_webp(img: &image::DynamicImage, path: &Path, quality: f32, original_size: u64) -> u64 {
     let webp_path = path.with_extension("webp");
     let (width, height) = img.dimensions();
     
-    // ИСПРАВЛЕНИЕ: Мы кодируем (.encode) ПРЯМО ВНУТРИ match.
-    // Это возвращает WebPMemory (владеющий тип), который безопасно выходит из match.
-    // Раньше мы пытались вернуть Encoder (ссылочный тип), который ссылался на умерший buf.
     let memory = match img {
         image::DynamicImage::ImageRgba8(buf) => {
              webp::Encoder::from_rgba(buf.as_raw(), width, height).encode(quality)
@@ -128,17 +122,21 @@ fn generate_webp(img: &image::DynamicImage, path: &Path, quality: f32) {
         }
     };
 
-    let _ = fs::write(webp_path, &*memory);
+    if fs::write(&webp_path, &*memory).is_ok() {
+        let webp_size = memory.len() as u64;
+        if original_size > webp_size {
+            return original_size - webp_size;
+        }
+    }
+    0
 }
 
-// --- ИСПРАВЛЕННАЯ ГЕНЕРАЦИЯ AVIF ---
-fn generate_avif(img: &image::DynamicImage, path: &Path) {
+fn generate_avif(img: &image::DynamicImage, path: &Path, original_size: u64) -> u64 {
     let avif_path = path.with_extension("avif");
     let rgba = img.to_rgba8();
     let width = rgba.width() as usize;
     let height = rgba.height() as usize;
     
-    // Здесь нужен `use rgb::FromSlice;` вверху файла, чтобы .as_rgba() сработал
     let src_img = imgref::Img::new(
         rgba.as_raw().as_slice().as_rgba(),
         width,
@@ -151,14 +149,19 @@ fn generate_avif(img: &image::DynamicImage, path: &Path) {
         .with_alpha_quality(70.0)
         .encode_rgba(src_img);
 
-    // ИСПРАВЛЕНИЕ: ravif теперь возвращает структуру, а не кортеж
     match enc {
         Ok(encoded_image) => {
-            // Берем поле .avif_file из результата
-            let _ = fs::write(avif_path, encoded_image.avif_file);
+            let data = encoded_image.avif_file;
+            if fs::write(&avif_path, &data).is_ok() {
+                let avif_size = data.len() as u64;
+                if original_size > avif_size {
+                    return original_size - avif_size;
+                }
+            }
         },
         Err(e) => eprintln!("Ошибка AVIF для {:?}: {}", path, e),
     }
+    0
 }
 
 fn main() {
@@ -192,35 +195,75 @@ fn main() {
     let bar = ProgressBar::new(files.len() as u64);
     bar.set_style(ProgressStyle::with_template("{spinner:.green} [{elapsed_precise}] [{bar:40.cyan/blue}] {pos}/{len}").unwrap().progress_chars("#>-"));
 
-    let total_saved = AtomicU64::new(0);
+    let total_input_size = AtomicU64::new(0);
+    let saved_orig = AtomicU64::new(0);
+    let saved_webp = AtomicU64::new(0);
+    let saved_avif = AtomicU64::new(0);
 
     files.par_iter().for_each(|path| {
         let ext = path.extension().unwrap_or_default().to_string_lossy().to_lowercase();
+        let original_file_size = fs::metadata(path).map(|m| m.len()).unwrap_or(0);
         
+        total_input_size.fetch_add(original_file_size, Ordering::Relaxed);
+
         if args.webp || args.avif {
             if let Ok(img) = image::open(path) {
                 if args.webp {
-                    generate_webp(&img, path, 75.0);
+                    let s = generate_webp(&img, path, 75.0, original_file_size);
+                    saved_webp.fetch_add(s, Ordering::Relaxed);
                 }
                 if args.avif {
-                    generate_avif(&img, path);
+                    let s = generate_avif(&img, path, original_file_size);
+                    saved_avif.fetch_add(s, Ordering::Relaxed);
                 }
             }
         }
 
-        let saved = if ext == "png" {
+        let s_orig = if ext == "png" {
             process_png(path, &pq, &oxi, args.png_min, args.png_max)
         } else {
             process_jpg(path, args.jpg_q)
         };
+        saved_orig.fetch_add(s_orig, Ordering::Relaxed);
 
-        total_saved.fetch_add(saved, Ordering::Relaxed);
         bar.inc(1);
     });
 
     bar.finish_with_message("Готово");
-    println!("\n✨ Сэкономлено на оригиналах: {}", format_size(total_saved.load(Ordering::Relaxed), DECIMAL));
+
+    let total_in = total_input_size.load(Ordering::Relaxed);
+    let s_orig = saved_orig.load(Ordering::Relaxed);
+    let s_webp = saved_webp.load(Ordering::Relaxed);
+    let s_avif = saved_avif.load(Ordering::Relaxed);
+
+    println!("\n📊 Итоговые результаты:");
     
-    println!("Enter для выхода...");
+    let calc_perc = |saved: u64| -> f64 {
+        if total_in > 0 { (saved as f64 / total_in as f64) * 100.0 } else { 0.0 }
+    };
+
+    println!("   Исходный общий вес:  {}", format_size(total_in, DECIMAL));
+    println!("   ------------------------------------------------");
+    
+    println!("   После сжатия (JPG/PNG): {} (🔻{:.1}%)", 
+        format_size(total_in - s_orig, DECIMAL), 
+        calc_perc(s_orig)
+    );
+    
+    if args.webp {
+        println!("   Версия WebP (Итого):    {} (🔻{:.1}%)", 
+            format_size(total_in - s_webp, DECIMAL), 
+            calc_perc(s_webp)
+        );
+    }
+    
+    if args.avif {
+        println!("   Версия AVIF (Итого):    {} (🔻{:.1}%)", 
+            format_size(total_in - s_avif, DECIMAL), 
+            calc_perc(s_avif)
+        );
+    }
+    
+    println!("\nНажмите Enter для выхода...");
     let _ = std::io::stdin().read_line(&mut String::new());
 }
