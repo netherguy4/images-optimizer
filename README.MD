@@ -8,6 +8,33 @@ A high-performance, multi-threaded command-line tool designed to compress images
 
 ## 📦 Installation & Setup
 
+### System Requirements
+
+#### Windows
+- **Microsoft Visual C++ Redistributable**: Required to run the application.
+  - [x64 (64-bit)](https://aka.ms/vc14/vc_redist.x64.exe)
+  - [x86 (32-bit)](https://aka.ms/vc14/vc_redist.x86.exe)
+  
+Download and install the version compatible with your system architecture.
+
+#### Linux/macOS
+- **pngquant**: Required for PNG optimization
+  ```bash
+  # Ubuntu/Debian
+  sudo apt-get install pngquant
+  
+  # macOS
+  brew install pngquant
+  ```
+- **oxipng**: Required for PNG lossless optimization
+  ```bash
+  # Ubuntu/Debian
+  sudo apt-get install oxipng
+  
+  # macOS
+  brew install oxipng
+  ```
+
 ### Add to PATH (Recommended)
 
 For convenient access from any directory, add the tool to your system PATH:
