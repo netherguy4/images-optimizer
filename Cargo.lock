@@ -510,7 +510,7 @@ dependencies = [
 
 [[package]]
 name = "images-optimizer"
-version = "0.1.0"
+version = "0.2.0"
 dependencies = [
  "clap",
  "console 0.16.2",

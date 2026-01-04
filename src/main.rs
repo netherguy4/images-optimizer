@@ -1,225 +1,34 @@
-use clap::{Parser, ValueHint};
-use console::{style, Term}; // Imported 'style' here
+mod cli;
+mod tools;
+mod fs_utils;
+mod image_ops;
+
+use clap::{Parser, CommandFactory};
+use console::{style, Term};
 use humansize::{format_size, DECIMAL};
 use indicatif::{ProgressBar, ProgressStyle};
 use rayon::prelude::*;
 use std::ffi::OsStr;
 use std::fs;
-use std::io::Write;
 use std::path::{Path, PathBuf};
-use std::process::Command;
 use std::sync::atomic::{AtomicU64, Ordering};
-use std::time::Instant;
-use tempfile::TempDir;
+use std::time::{Duration, Instant}; 
 use walkdir::WalkDir;
-use image::GenericImageView;
-use rgb::FromSlice; 
 
-#[cfg(target_os = "windows")]
-const PNGQUANT_BIN: &[u8] = include_bytes!("../bin/pngquant.exe");
-#[cfg(target_os = "windows")]
-const OXIPNG_BIN: &[u8] = include_bytes!("../bin/oxipng.exe");
-
-#[derive(Parser, Debug)]
-#[command(
-    author, 
-    version, 
-    about = "High-performance parallel image optimizer.",
-    long_about = "A multi-threaded CLI tool designed to compress JPG and PNG images recursively.\n\nIt utilizes mozjpeg, pngquant, and oxipng to reduce file sizes while preserving visual quality. It can also optionally generate next-gen WebP and AVIF formats."
-)]
-struct Args {
-    #[arg(default_value = ".", value_delimiter = ',', num_args = 1.., value_hint = ValueHint::AnyPath, help = "List of files or directories to process.")]
-    paths: Vec<String>,
-
-    #[arg(long, default_value_t = 80, value_parser = clap::value_parser!(u8).range(1..=100), help_heading = "Quality Settings", help = "Target JPEG quality (0-100).")]
-    jpg_q: u8,
-
-    #[arg(long, default_value_t = 65, value_parser = clap::value_parser!(u8).range(1..=100), help_heading = "Quality Settings", help = "Minimum PNG quality allowed (0-100).")]
-    png_min: u8,
-
-    #[arg(long, default_value_t = 80, value_parser = clap::value_parser!(u8).range(1..=100), help_heading = "Quality Settings", help = "Maximum PNG quality allowed (0-100).")]
-    png_max: u8,
-
-    #[arg(long, help_heading = "Format Generation", help = "Generate WebP versions alongside originals.")]
-    webp: bool,
-
-    #[arg(long, help_heading = "Format Generation", help = "Generate AVIF versions alongside originals.")]
-    avif: bool,
-
-    #[arg(long, help = "Overwrite original files in place.")]
-    replace: bool,
-
-    #[arg(short = 'S', long, help = "Suppress all standard output.")]
-    silent: bool,
-}
-
-enum ToolPath {
-    Path(PathBuf),
-    #[allow(dead_code)]
-    Command(String),
-}
-
-fn get_tool_ref(t: &ToolPath) -> &OsStr {
-    match t {
-        ToolPath::Path(p) => p.as_os_str(),
-        ToolPath::Command(c) => OsStr::new(c),
-    }
-}
-
-fn get_png_tools() -> Result<(Option<TempDir>, ToolPath, ToolPath), std::io::Error> {
-    #[cfg(target_os = "windows")]
-    {
-        let dir = tempfile::tempdir()?;
-        let pq_path = dir.path().join("pngquant.exe");
-        let oxi_path = dir.path().join("oxipng.exe");
-        let mut f1 = fs::File::create(&pq_path)?;
-        f1.write_all(PNGQUANT_BIN)?;
-        let mut f2 = fs::File::create(&oxi_path)?;
-        f2.write_all(OXIPNG_BIN)?;
-        Ok((Some(dir), ToolPath::Path(pq_path), ToolPath::Path(oxi_path)))
-    }
-
-    #[cfg(not(target_os = "windows"))]
-    {
-        Ok((None, ToolPath::Command("pngquant".to_string()), ToolPath::Command("oxipng".to_string())))
-    }
-}
-
-fn copy_dir_recursive(src: &Path, dst: &Path) -> std::io::Result<()> {
-    if !dst.exists() {
-        fs::create_dir_all(dst)?;
-    }
-    for entry in fs::read_dir(src)? {
-        let entry = entry?;
-        let ty = entry.file_type()?;
-        let dst_path = dst.join(entry.file_name());
-        if ty.is_dir() {
-            copy_dir_recursive(&entry.path(), &dst_path)?;
-        } else {
-            fs::copy(entry.path(), &dst_path)?;
-        }
-    }
-    Ok(())
-}
-
-fn process_jpg(path: &Path, quality: u8) -> u64 {
-    let original_size = fs::metadata(path).map(|m| m.len()).unwrap_or(0);
-    let img = match image::open(path) {
-        Ok(i) => i.to_rgb8(),
-        Err(_) => return 0,
-    };
-    let width = img.width() as usize;
-    let height = img.height() as usize;
-    let pixels = img.as_raw();
-
-    let mut comp = mozjpeg::Compress::new(mozjpeg::ColorSpace::JCS_RGB);
-    comp.set_size(width, height);
-    comp.set_quality(quality as f32);
-    comp.set_progressive_mode();
-    comp.set_optimize_scans(true);
-    let mut comp = comp.start_compress(Vec::new()).unwrap();
-    
-    if comp.write_scanlines(pixels).is_ok() {
-        let compressed_data = match comp.finish() {
-            Ok(d) => d,
-            Err(_) => return 0,
-        };
-        let new_len = compressed_data.len() as u64;
-        if new_len > 0 && new_len < original_size {
-             if let Ok(mut f) = fs::File::create(path) {
-                 if f.write_all(&compressed_data).is_ok() {
-                     return original_size - new_len;
-                 }
-             }
-        }
-    }
-    0
-}
-
-fn process_png(path: &Path, pq: &ToolPath, oxi: &ToolPath, min: u8, max: u8) -> u64 {
-    let original_size = fs::metadata(path).map(|m| m.len()).unwrap_or(0);
-    
-    #[cfg(target_os = "windows")]
-    use std::os::windows::process::CommandExt;
-    const CREATE_NO_WINDOW: u32 = 0x08000000;
-
-    let mut cmd = Command::new(get_tool_ref(pq));
-    cmd.args([&format!("--quality={}-{}", min, max), "--speed=3", "--force", "--ext=.png", "--skip-if-larger"]).arg(path);
-    #[cfg(target_os = "windows")]
-    cmd.creation_flags(CREATE_NO_WINDOW);
-    let _ = cmd.output();
-
-    let mut cmd2 = Command::new(get_tool_ref(oxi));
-    cmd2.args(["-o", "4", "--strip", "all", "-t", "1"]).arg(path);
-    #[cfg(target_os = "windows")]
-    cmd2.creation_flags(CREATE_NO_WINDOW);
-    let _ = cmd2.output();
-
-    let new_size = fs::metadata(path).map(|m| m.len()).unwrap_or(original_size);
-    if original_size > new_size { original_size - new_size } else { 0 }
-}
-
-fn generate_webp(img: &image::DynamicImage, path: &Path, quality: f32, original_size: u64) -> u64 {
-    let webp_path = path.with_extension("webp");
-    let (width, height) = img.dimensions();
-    
-    let memory = match img {
-        image::DynamicImage::ImageRgba8(buf) => {
-             webp::Encoder::from_rgba(buf.as_raw(), width, height).encode(quality)
-        },
-        image::DynamicImage::ImageRgb8(buf) => {
-             webp::Encoder::from_rgb(buf.as_raw(), width, height).encode(quality)
-        },
-        _ => {
-            let buf = img.to_rgba8();
-            webp::Encoder::from_rgba(buf.as_raw(), width, height).encode(quality)
-        }
-    };
-
-    if fs::write(&webp_path, &*memory).is_ok() {
-        let webp_size = memory.len() as u64;
-        if original_size > webp_size {
-            return original_size - webp_size;
-        }
-    }
-    0
-}
-
-fn generate_avif(img: &image::DynamicImage, path: &Path, original_size: u64) -> u64 {
-    let avif_path = path.with_extension("avif");
-    let rgba = img.to_rgba8();
-    let width = rgba.width() as usize;
-    let height = rgba.height() as usize;
-    
-    let src_img = imgref::Img::new(
-        rgba.as_raw().as_slice().as_rgba(),
-        width,
-        height,
-    );
-
-    let enc = ravif::Encoder::new()
-        .with_quality(65.0) 
-        .with_speed(4)
-        .with_alpha_quality(70.0)
-        .encode_rgba(src_img);
-
-    match enc {
-        Ok(encoded_image) => {
-            let data = encoded_image.avif_file;
-            if fs::write(&avif_path, &data).is_ok() {
-                let avif_size = data.len() as u64;
-                if original_size > avif_size {
-                    return original_size - avif_size;
-                }
-            }
-        },
-        Err(e) => eprintln!("AVIF Error for {:?}: {}", path, e),
-    }
-    0
-}
+use cli::Args;
+use tools::get_png_tools;
+use fs_utils::copy_dir_recursive;
+use image_ops::{process_jpg, process_png, generate_webp, generate_avif};
 
 fn main() {
     let args = Args::parse();
+
+    if args.paths.is_empty() {
+        let mut cmd = Args::command();
+        cmd.print_help().unwrap();
+        return;
+    }
+
     let total_start_time = Instant::now();
 
     if args.avif && !args.silent {
@@ -237,7 +46,7 @@ fn main() {
 
     let supported_exts = ["png", "jpg", "jpeg"];
     let mut files_to_process: Vec<(PathBuf, PathBuf)> = Vec::new();
-    let mut copy_duration = std::time::Duration::new(0, 0);
+    let mut copy_duration = Duration::new(0, 0);
     let scan_start = Instant::now();
 
     let is_single_dir_mode = args.paths.len() == 1 && Path::new(&args.paths[0]).is_dir();
@@ -256,14 +65,6 @@ fn main() {
             let new_name = format!("{}__optimized", root_name);
             target_dir = input_path.parent().unwrap_or(Path::new(".")).join(new_name);
             
-            if target_dir.exists() {
-                if !args.silent { println!("{}", style(format!("Cleaning up existing output directory: {:?}", target_dir)).dim()); }
-                if let Err(e) = fs::remove_dir_all(&target_dir) {
-                    eprintln!("{} {}", style("Error removing directory:").red(), e);
-                    return;
-                }
-            }
-
             if !args.silent { 
                 println!("Mode: {} (Copying to {})", style("SAFE").green().bold(), style(target_dir.to_string_lossy()).cyan()); 
             }
@@ -295,7 +96,7 @@ fn main() {
         files_to_process.extend(scanned);
 
     } else {
-        if !args.silent { println!("Mode: {}", style("Specific File List Processing").magenta()); }
+        if !args.silent { println!("Mode: {}", style("Specific File/Folder List Processing").magenta()); }
         let copy_start = Instant::now();
         
         for p_str in &args.paths {
@@ -304,8 +105,44 @@ fn main() {
                 if !args.silent { eprintln!("{}", style(format!("Skipping not found: {:?}", path)).yellow()); }
                 continue;
             }
+
             if path.is_dir() {
-                if !args.silent { eprintln!("{}", style(format!("Skipping directory in list mode: {:?}", path)).yellow()); }
+                let target_dir_root = if args.replace {
+                    path.to_path_buf()
+                } else {
+                    let root_name = path.file_name().unwrap_or_default().to_string_lossy();
+                    let new_name = format!("{}__optimized", root_name);
+                    path.parent().unwrap_or(Path::new(".")).join(new_name)
+                };
+
+                if !args.silent {
+                    println!("  > Processing Directory: {} -> {}", 
+                        style(path.file_name().unwrap_or_default().to_string_lossy()).cyan(),
+                        style(target_dir_root.file_name().unwrap_or_default().to_string_lossy()).yellow()
+                    );
+                }
+
+                if !args.replace {
+                    if let Err(e) = copy_dir_recursive(path, &target_dir_root) {
+                        eprintln!("{} {:?}: {}", style("Error copying directory").red(), path, e);
+                        continue;
+                    }
+                }
+
+                let scanned: Vec<(PathBuf, PathBuf)> = WalkDir::new(&target_dir_root)
+                    .into_iter()
+                    .filter_map(|e| e.ok())
+                    .filter(|e| {
+                        e.path().extension()
+                            .map(|ext| supported_exts.contains(&ext.to_string_lossy().to_lowercase().as_str()))
+                            .unwrap_or(false)
+                    })
+                    .map(|e| {
+                        let p = e.into_path();
+                        (p.clone(), p)
+                    })
+                    .collect();
+                files_to_process.extend(scanned);
                 continue;
             }
             
@@ -353,10 +190,13 @@ fn main() {
     if !args.silent { println!("Found: {} files. Processing...", style(files_to_process.len()).bold().yellow()); }
     
     let bar = ProgressBar::new(files_to_process.len() as u64);
-    bar.set_style(ProgressStyle::with_template("{spinner:.green} [{elapsed_precise:.bold}] [{bar:40.cyan/white}] {pos}/{len} ({eta})")
+    
+    bar.set_style(ProgressStyle::with_template("{spinner:.green} [{elapsed_precise:.bold}] [{bar:40.cyan/white}] {pos}/{len} ({eta}) {msg}")
         .unwrap()
         .tick_chars("|/-\\ ")
         .progress_chars("#>-"));
+
+    bar.enable_steady_tick(Duration::from_millis(100));
 
     let total_input_size = AtomicU64::new(0);
     
@@ -372,6 +212,9 @@ fn main() {
     let process_start_time = Instant::now();
 
     files_to_process.par_iter().for_each(|(path, naming_path)| {
+        let current_file_name = path.file_name().unwrap_or_default().to_string_lossy();
+        bar.set_message(format!("{}", style(current_file_name).dim()));
+
         let ext = path.extension().unwrap_or_default().to_string_lossy().to_lowercase();
         let original_file_size = fs::metadata(path).map(|m| m.len()).unwrap_or(0);
         
