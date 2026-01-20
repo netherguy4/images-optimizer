@@ -30,7 +30,7 @@ jobs:
             os: windows-latest
             target: x86_64-pc-windows-msvc
             bin_name: images-optimizer.exe
-            asset_name: images-optimizer-windows.exe
+            asset_name: blacksmith-4vcpu-windows-2025
           
           - os_name: macOS
             os: macos-latest
